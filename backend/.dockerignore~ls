@@ -1,0 +1,4 @@
+__pycache__
+*.pyc
+.env
+gcp_skus_cache.json
