@@ -67,11 +67,30 @@ Rules:
 - Calculate as per metric; if it's free first x units make sure you show the substraction in calculation
 - "cost" must equal qty * unitPrice exactly (pre-tax). Do not round unless
   the arithmetic naturally produces a rounded figure.
-- For VM requirements, select only E-series VM shapes; storage is Block
-  Storage - label it clearly as VM storage in "displayName" so it's
-  distinguishable from standalone Block Storage, but you do not need to
-  force an exact product-list string match. Include an appropriate OS
-  image / licensing line item where relevant.
+- For VM requirements, use ONLY E-series (AMD, "Standard - E<n>") flexible
+  shapes, and choose the shape with this fixed procedure so the same input
+  always gives the same answer:
+    1. List the E-series families (E2, E3, E4, E5, ...) that appear in
+       Available Products with BOTH an OCPU metric and a Memory metric.
+       Never use a shape or family that is not in Available Products.
+    2. Pick the family with the LOWEST OCPU unitPrice. If two or more
+       families tie, pick the one with the HIGHEST generation number.
+    3. Use that SAME family for the OCPU line and the Memory line of every VM
+       requirement in the sheet. Never mix families within a VM, and never
+       use different families for VMs that have the same specs.
+    4. Do not switch to a different shape/family to "optimise" individual
+       VMs, and do not use Micro, Dense I/O, GPU, Bare Metal or other
+       non-E-series shapes.
+  Storage is Block Storage - label it clearly as VM storage in "displayName"
+  so it's distinguishable from standalone Block Storage, but you do not need
+  to force an exact product-list string match. Include an OS image /
+  licensing line item only when the requirement states an OS that has a
+  matching product in Available Products (pick the cheapest matching one);
+  otherwise do not add one.
+- Whenever more than one Available Product fits a requirement equally well,
+  choose the one with the lowest unitPrice; if still tied, the one whose
+  displayName sorts first alphabetically. Never choose randomly or vary the
+  choice between requirements with identical specs.
 - Avoid Cloud@Customer products whenever a non-Cloud@Customer alternative
   exists.
 - Avoid Exadata unless specified.
@@ -230,7 +249,7 @@ def ask_gemini_batch(reqs: List[Dict[str, Any]], candidates: List[Dict[str, Any]
     )
     r = generate_with_retry(
         client, GEMINI_MODEL, prompt,
-        types.GenerateContentConfig(response_mime_type="application/json"),
+        types.GenerateContentConfig(response_mime_type="application/json", temperature=0),
     )
     print(prompt)
     return json.loads(r.text)

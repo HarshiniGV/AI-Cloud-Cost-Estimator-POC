@@ -107,7 +107,12 @@ Product selection (closest match ):
    beats one that matches fewer.
 2. If several products match equally well, choose the one with the LOWEST
    unitPrice. Never pick a more expensive product when an equally matching,
-   cheaper one exists. Also avoid Reservation/Reserve types.
+   cheaper one exists. Also avoid Reservation/Reserve types. If products are
+   still tied on price, choose the one whose displayName sorts first
+   alphabetically, so the same input always gives the same choice.
+   Requirements with identical specs must get the identical product; never
+   vary the instance type / shape between them, and only use products that
+   appear in Available Products.
 3. Do not choose a variant that differs only by a purchase or usage option the
    requirement did not ask for (e.g. dedicated, reserved or pre-paid capacity,
    bundled software, premium support) when a plain standard variant exists.
@@ -399,7 +404,7 @@ def build_catalog(files: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]
 def _call_gemini_json(prompt: str) -> Any:
     r = generate_with_retry(
         client, GEMINI_MODEL, prompt,
-        types.GenerateContentConfig(response_mime_type="application/json"),
+        types.GenerateContentConfig(response_mime_type="application/json", temperature=0),
     )
     return json.loads(r.text)
 

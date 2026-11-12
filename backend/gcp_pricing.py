@@ -189,8 +189,9 @@ MAPPING_SCHEMA = {
 
 SYSTEM_INSTRUCTIONS = f"""You map infrastructure requirement items (any vendor's terminology) to Google Cloud Compute Engine.
 Each item has item_index, category and its original fields. Return one mapping per item, same item_index.
-- VM/instance -> kind "vm". Choose machine_family from: {", ".join(sorted(SUPPORTED_FAMILIES))} (default E2, or N2 for higher performance).
-  Give vcpu and ram_gib. 1 OCPU = 2 vCPUs. Windows/licensed workloads are still priced as Linux compute.
+- VM/instance -> kind "vm". Choose machine_family from: {", ".join(sorted(SUPPORTED_FAMILIES))} (always E2, unless the item explicitly asks for high/premium performance, then N2;
+  never pick any other family for the same kind of item - identical specs must map identically).
+  Give vcpu and ram_gib exactly as stated in the item (do not resize or "optimise"). 1 OCPU = 2 vCPUs. Windows/licensed workloads are still priced as Linux compute.
 - Block storage / disks -> kind "disk", disk_type pd-balanced (default), pd-ssd for high performance, pd-standard for cold. size_gb = capacity.
 - Object/file storage, databases, networking, anything else -> kind "unsupported".
 Respond ONLY via the schema."""
@@ -204,7 +205,7 @@ def gemini_map(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             system_instruction=SYSTEM_INSTRUCTIONS,
             response_mime_type="application/json",
             response_schema=MAPPING_SCHEMA,
-            temperature=0.1,
+            temperature=0,
         ),
     )
     return json.loads(resp.text).get("mappings", [])
