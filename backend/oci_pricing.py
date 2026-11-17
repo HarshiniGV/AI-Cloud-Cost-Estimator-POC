@@ -1,7 +1,9 @@
 import os
 import io
+import re
 import json
-from typing import List, Dict, Any
+from decimal import Decimal
+from typing import List, Dict, Any, Optional
 import requests
 from openpyxl import load_workbook
 from dotenv import load_dotenv
@@ -24,81 +26,76 @@ if not GEMINI_API_KEY and not use_oci():
 client = make_client(GEMINI_API_KEY)
 
 # ---------------------------------------------------------------------------
-# Prompt: the AI now receives the real unitPrice for every candidate product
-# and is responsible for BOTH determining qty and multiplying it out into a
-# final "cost". Python no longer re-looks-up the price by (displayName,
-# metricName) after the fact - that lookup was fragile because the prompt
-# previously told the model to relabel some line items (e.g. "VM-Storage-
-# block") in ways that don't exactly match the Oracle price list, causing
-# "Unresolved product/metric" warnings even when the estimate was otherwise
-# correct. Now Gemini is explicitly told to copy unitPrice verbatim from the
-# Available Products list and do the arithmetic itself, so nothing needs to
-# match afterwards - Python just sums the "cost" values it returns.
-#
-# This single prompt is sent ONCE per /api/estimate request, covering ALL
-# requirements from the uploaded sheet in one Gemini call.
+# The model only decides WHICH product + metric and HOW MUCH (qty).
+# It must copy productName / metricName EXACTLY from Available Products.
+# Python then looks up the real unitPrice (full precision, tier-aware) and
+# does the multiplication, so prices can never be rounded or invented.
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = """You are an Oracle Cloud Infrastructure pricing expert.
 You will be given a list of Requirements (each with a "category" and
 "details") and a list of Available Products (each with displayName,
 metricName, unitPrice, and the "category" it was matched against).
 
-For EACH requirement, work out which product(s)/metric(s) are needed, how
-much of each metric is consumed, and the resulting pre-tax cost. Return
-ONLY a JSON array, no markdown fences, no commentary, covering ALL
-requirements together:
+For EACH requirement, work out which product(s)/metric(s) are needed and how
+much of each metric is consumed. Return ONLY a JSON array, no markdown
+fences, no commentary, covering ALL requirements together:
 
 [
   {
     "category": "<the requirement's category, copied exactly>",
-    "displayName": "<label for this line item - can be descriptive, does NOT need to match Available Products verbatim>",
-    "metricName": "<the metric being consumed, e.g. 'OCPU Per Hour'>",
-    "unitPrice": <the unitPrice copied EXACTLY from the Available Products entry you used>,
-    "qty": <numeric quantity of the metric consumed>,
-    "calculation": "<plain-English arithmetic showing the full derivation, e.g. '744 hrs/month * 2 OCPUs * 5.00 USD = 7440'>",
-    "cost": <qty * unitPrice, computed by you, numeric, pre-tax>
+    "label": "<descriptive label for this line item, e.g. 'VM 1 - OCPU (E5)'>",
+    "productName": "<displayName copied EXACTLY, character for character, from the Available Products entry you used>",
+    "metricName": "<metricName copied EXACTLY from that same entry>",
+    "qty": <numeric quantity of the metric consumed over a month>,
+    "calculation": "<plain-English derivation of qty, e.g. '744 hrs/month * 2 OCPUs = 1488'>"
   }
 ]
 
 Rules:
-- Only use unitPrice values that come from the Available Products supplied
-  for that requirement's category - never invent a price. Copy it exactly
-  as given, then do the multiplication yourself.
-- Calculate as per metric; if it's free first x units make sure you show the substraction in calculation
-- "cost" must equal qty * unitPrice exactly (pre-tax). Do not round unless
-  the arithmetic naturally produces a rounded figure.
-- For VM requirements, use ONLY E-series (AMD, "Standard - E<n>") flexible
-  shapes, and choose the shape with this fixed procedure so the same input
-  always gives the same answer:
-    1. List the E-series families (E2, E3, E4, E5, ...) that appear in
-       Available Products with BOTH an OCPU metric and a Memory metric.
-       Never use a shape or family that is not in Available Products.
-    2. Pick the family with the LOWEST OCPU unitPrice. If two or more
-       families tie, pick the one with the HIGHEST generation number.
-    3. Use that SAME family for the OCPU line and the Memory line of every VM
-       requirement in the sheet. Never mix families within a VM, and never
-       use different families for VMs that have the same specs.
-    4. Do not switch to a different shape/family to "optimise" individual
-       VMs, and do not use Micro, Dense I/O, GPU, Bare Metal or other
-       non-E-series shapes.
-  Storage is Block Storage - label it clearly as VM storage in "displayName"
-  so it's distinguishable from standalone Block Storage, but you do not need
-  to force an exact product-list string match. Include an OS image /
-  licensing line item only when the requirement states an OS that has a
-  matching product in Available Products (pick the cheapest matching one);
-  otherwise do not add one.
-- Whenever more than one Available Product fits a requirement equally well,
-  choose the one with the lowest unitPrice; if still tied, the one whose
-  displayName sorts first alphabetically. Never choose randomly or vary the
-  choice between requirements with identical specs.
-- Avoid Cloud@Customer products whenever a non-Cloud@Customer alternative
-  exists.
-- Avoid Exadata unless specified.
-- Do NOT apply or mention tax/GST anywhere - qty, unitPrice, and cost are
-  all pre-tax.
-- Every requirement in the input must be addressed by at least one item
-  in the output (unless truly no candidate product fits it).
-- Block Storage PU = GB*20 for high performance else *10.
+- productName and metricName MUST be an exact pair from Available Products
+  for that requirement's category. Never invent or reword them. Do NOT
+  output prices or costs; they are computed by the system.
+- "qty" is the raw consumption of the metric for one month (744 hours per
+  month for hourly metrics). Do NOT subtract free-tier amounts - free
+  tiers are applied automatically by the system. Do not round qty.
+- Multiply by the "Count" of each requirement row where present.
+- VM SHAPE SELECTION (fixed procedure, so the same input always gives the
+  same answer):
+    A. If a requirement row has a "Shape" value (e.g. "E5", "E4"), you MUST
+       use that family: the product whose displayName contains
+       "Standard - <Shape>" for the OCPU line and the same family's Memory
+       product for the Memory line. Never substitute another family for a
+       row that specifies a shape. If the specified family does not exist
+       in Available Products, still pick the closest same-letter family
+       and say so in "calculation".
+    B. If the row has NO Shape (blank/missing), use ONLY E-series (AMD,
+       "Standard - E<n>") flexible shapes:
+         1. List the E-series families that appear in Available Products
+            with BOTH an OCPU metric and a Memory metric.
+         2. Pick the family with the LOWEST OCPU unitPrice; on a tie pick
+            the HIGHEST generation number.
+         3. Use that same family for the OCPU and Memory lines of every
+            row without a Shape.
+    C. Never use Micro, Dense I/O, GPU, Bare Metal, VMware, Ax or other
+       non-standard shapes.
+- Each VM needs: one OCPU line (qty = 744 * OCPU * Count), one Memory line
+  (qty = 744 * Memory_GB * Count), and one Block Volume Storage line
+  (qty = Storage_GB * Count) plus one Block Volume Performance Units line
+  (qty = Performance_Units * Count if given, otherwise Storage_GB * 10
+  * Count, or * 20 for high performance). Label storage lines clearly as
+  VM storage in "label".
+- Include an OS image / licensing line item only when the requirement
+  states an OS that has a matching product in Available Products (pick the
+  cheapest matching one). Linux has no charge - add no line for it.
+- Whenever more than one Available Product fits equally well, choose the
+  lowest unitPrice; if still tied, the displayName that sorts first
+  alphabetically.
+- Object Storage: use "Object Storage - Storage" with qty = Storage_GB and
+  "Object Storage - Requests" with qty = Requests_Per_Month / 10000.
+- Avoid Cloud@Customer products. Avoid Exadata unless specified.
+- Do NOT apply or mention tax/GST anywhere.
+- Every requirement must be addressed by at least one item in the output
+  (unless truly no candidate product fits it).
 """
 
 _products_cache: List[Dict[str, Any]] = []
@@ -113,32 +110,87 @@ def fetch_products(force: bool = False) -> List[Dict[str, Any]]:
     return _products_cache
 
 
-def build_lookup(products) -> Dict[tuple, float]:
+def _tiers(p) -> List[Dict[str, Any]]:
+    locs = p.get("currencyCodeLocalizations") or []
+    if not locs:
+        return []
+    return locs[0].get("prices") or []
+
+
+def build_lookup(products) -> Dict[tuple, List[Dict[str, Any]]]:
+    """(displayName, metricName) -> full list of price tiers (not just tier 0)."""
     lk = {}
     for p in products:
-        locs = p.get("currencyCodeLocalizations") or []
-        if not locs:
-            continue
-        prices = locs[0].get("prices") or []
-        if not prices:
-            continue
-        lk[(p["displayName"], p["metricName"])] = prices[0]["value"]
+        tiers = _tiers(p)
+        if tiers:
+            lk[(p["displayName"], p["metricName"])] = tiers
     return lk
 
 
-def relevant_products(category_name: str, products, lookup, limit: int = None):
+def headline_price(tiers) -> float:
+    """Price shown to the model: first PAID tier if there is a free tier."""
+    paid = [t["value"] for t in tiers if t["value"] > 0]
+    return paid[0] if paid else tiers[0]["value"]
+
+
+def tiered_cost(tiers, qty) -> Decimal:
+    """Exact (Decimal) cost, honouring free tiers / volume tiers."""
+    q = Decimal(str(qty))
+    if len(tiers) == 1 and "rangeMin" not in tiers[0]:
+        return q * Decimal(str(tiers[0]["value"]))
+    total = Decimal(0)
+    for t in tiers:
+        lo = Decimal(str(t.get("rangeMin", 0)))
+        hi = Decimal(str(t.get("rangeMax", 10 ** 15)))
+        used = min(q, hi) - lo
+        if used > 0:
+            total += used * Decimal(str(t["value"]))
+    return total
+
+
+_E_FAMILY = re.compile(r"standard\s*-\s*(e\d+)\s*-", re.I)
+
+
+def _family(display_name: str) -> Optional[str]:
+    m = _E_FAMILY.search(display_name)
+    return m.group(1).upper() if m else None
+
+
+def _shapes_in(req) -> set:
+    return {
+        str(d.get("Shape")).strip().upper()
+        for d in req.get("details", [])
+        if d.get("Shape")
+    }
+
+
+def relevant_products(category_name: str, products, lookup, shapes=None, limit: int = None):
     target = category_name.lower().strip()
     results = []
     for p in products:
         svc_cat = p.get("serviceCategory", "").lower().strip()
-        if target in svc_cat and 'cloud@customer' not in svc_cat:
+        if target in svc_cat and "cloud@customer" not in svc_cat:
             key = (p["displayName"], p["metricName"])
             if key in lookup:
                 results.append({
                     "displayName": p["displayName"],
                     "metricName": p["metricName"],
-                    "unitPrice": lookup[key],
+                    "unitPrice": headline_price(lookup[key]),
                 })
+
+    # Prioritise what matters so the `limit` can never cut it off:
+    # requested shape families first, then other E-series, then the rest.
+    shapes = shapes or set()
+
+    def rank(c):
+        fam = _family(c["displayName"])
+        if fam and fam in shapes:
+            return 0
+        if fam:
+            return 1
+        return 2
+
+    results.sort(key=lambda c: (rank(c), c["displayName"]))
     return results[:limit] if limit else results
 
 
@@ -159,14 +211,8 @@ def excel_to_requirements(file_bytes):
     i = 0
     while i < len(rows):
         row = rows[i]
-        # Detect category row
-        if (
-            row
-            and row[0]
-            and str(row[0]).strip().startswith("Category:")
-        ):
+        if row and row[0] and str(row[0]).strip().startswith("Category:"):
             category = str(row[0]).replace("Category:", "").strip()
-            # Header row
             if i + 1 >= len(rows):
                 break
             headers = [
@@ -177,32 +223,19 @@ def excel_to_requirements(file_bytes):
             j = i + 2
             while j < len(rows):
                 current = rows[j]
-                # Stop at next category
-                if (
-                    current
-                    and current[0]
-                    and str(current[0]).strip().startswith("Category:")
-                ):
+                if current and current[0] and str(current[0]).strip().startswith("Category:"):
                     break
-                # Skip blank rows
                 if not any(cell is not None for cell in current):
                     j += 1
                     continue
                 item = {}
                 for k, header in enumerate(headers):
-                    if (
-                        header
-                        and k < len(current)
-                        and current[k] is not None
-                    ):
+                    if header and k < len(current) and current[k] is not None:
                         item[header] = current[k]
                 if item:
                     details.append(item)
                 j += 1
-            output.append({
-                "category": category,
-                "details": details
-            })
+            output.append({"category": category, "details": details})
             i = j
         else:
             i += 1
@@ -211,17 +244,13 @@ def excel_to_requirements(file_bytes):
 
 
 def build_batch_candidates(reqs, products, lookup, limit_per_req: int = 150):
-    """
-    For each requirement, find relevant candidate products (with their real
-    unitPrice attached) and tag them with the category so Gemini can map its
-    output back correctly and multiply out the cost itself.
-    Returns a flat, deduplicated list.
-    """
     seen = set()
     batch_candidates = []
     for req in reqs:
         category = req.get("category", "")
-        cands = relevant_products(category, products, lookup, limit=limit_per_req)
+        cands = relevant_products(
+            category, products, lookup, shapes=_shapes_in(req), limit=limit_per_req
+        )
         for c in cands:
             key = (category, c["displayName"], c["metricName"])
             if key in seen:
@@ -237,11 +266,6 @@ def build_batch_candidates(reqs, products, lookup, limit_per_req: int = 150):
 
 
 def ask_gemini_batch(reqs: List[Dict[str, Any]], candidates: List[Dict[str, Any]]):
-    """
-    Single Gemini call covering ALL requirements + ALL matched candidates
-    (with real unitPrice) for the entire uploaded sheet. Gemini returns the
-    final "cost" per line item already multiplied out.
-    """
     prompt = (
         SYSTEM_PROMPT
         + "\nRequirements:\n" + json.dumps(reqs, indent=2, default=str)
@@ -251,16 +275,10 @@ def ask_gemini_batch(reqs: List[Dict[str, Any]], candidates: List[Dict[str, Any]
         client, GEMINI_MODEL, prompt,
         types.GenerateContentConfig(response_mime_type="application/json", temperature=0),
     )
-    print(prompt)
     return json.loads(r.text)
 
 
 def run_oci_estimate(file_bytes: bytes) -> Dict[str, Any]:
-    """
-    Full OCI estimation pipeline for a given uploaded Excel file's raw bytes.
-    Mirrors the original /api/estimate endpoint logic exactly, just extracted
-    into a reusable function so main.py can call it alongside Azure.
-    """
     reqs = excel_to_requirements(file_bytes)
 
     if not reqs:
@@ -272,7 +290,6 @@ def run_oci_estimate(file_bytes: bytes) -> Dict[str, Any]:
     warnings: List[str] = []
     batch_candidates = build_batch_candidates(reqs, products, lookup)
 
-    # Flag requirements with zero matched candidates up front
     matched_categories = {c["category"] for c in batch_candidates}
     for req in reqs:
         cat = req.get("category", "")
@@ -285,298 +302,31 @@ def run_oci_estimate(file_bytes: bytes) -> Dict[str, Any]:
     items = ask_gemini_batch(reqs, batch_candidates)
 
     report = []
+    total = Decimal(0)
     for it in items:
+        name = it.get("productName") or it.get("displayName", "")
+        metric = it.get("metricName", "")
+        tiers = lookup.get((name, metric))
+        if not tiers:
+            warnings.append(f"Unresolved product/metric '{name}' / '{metric}'; skipped")
+            continue
         try:
-            cost = round(float(it.get("cost", 0)), 2)
-        except (TypeError, ValueError):
-            warnings.append(
-                f"Could not parse cost for '{it.get('displayName', '?')}'; skipped"
-            )
+            qty = Decimal(str(it.get("qty", 0)))
+        except Exception:
+            warnings.append(f"Could not parse qty for '{name}'; skipped")
             continue
 
+        cost = tiered_cost(tiers, qty)          # exact, tier-aware
+        total += cost
         report.append({
             "category": it.get("category", ""),
-            "product": it.get("displayName", ""),
-            "metric": it.get("metricName", ""),
+            "product": it.get("label") or name,
+            "productName": name,
+            "metric": metric,
+            "unitPrice": headline_price(tiers),  # full precision, never rounded
+            "qty": float(qty),
             "calculation": it.get("calculation", ""),
-            "cost": cost,
+            "cost": float(round(cost, 4)),       # keep 4dp; round only for display
         })
 
-    total = round(sum(r["cost"] for r in report), 2)
-    return {"report": report, "total": total, "warnings": warnings}
-# import os
-# import io
-# import json
-# from typing import List, Dict, Any
-# import requests
-# from openpyxl import load_workbook
-# from dotenv import load_dotenv
-# from google import genai
-# from google.genai import types
-
-# load_dotenv()
-
-# GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-# ORACLE_PRICE_URL = "https://apexapps.oracle.com/pls/apex/cetools/api/v1/products?currencyCode=USD"
-
-# if not GEMINI_API_KEY:
-#     raise RuntimeError(
-#         "GEMINI_API_KEY not set. Copy backend/.env.example to backend/.env and fill it in."
-#     )
-
-# client = genai.Client(api_key=GEMINI_API_KEY)
-
-# # ---------------------------------------------------------------------------
-# # Prompt: the AI now receives the real unitPrice for every candidate product
-# # and is responsible for BOTH determining qty and multiplying it out into a
-# # final "cost". Python no longer re-looks-up the price by (displayName,
-# # metricName) after the fact - that lookup was fragile because the prompt
-# # previously told the model to relabel some line items (e.g. "VM-Storage-
-# # block") in ways that don't exactly match the Oracle price list, causing
-# # "Unresolved product/metric" warnings even when the estimate was otherwise
-# # correct. Now Gemini is explicitly told to copy unitPrice verbatim from the
-# # Available Products list and do the arithmetic itself, so nothing needs to
-# # match afterwards - Python just sums the "cost" values it returns.
-# #
-# # This single prompt is sent ONCE per /api/estimate request, covering ALL
-# # requirements from the uploaded sheet in one Gemini call.
-# # ---------------------------------------------------------------------------
-# SYSTEM_PROMPT = """You are an Oracle Cloud Infrastructure pricing expert.
-# You will be given a list of Requirements (each with a "category" and
-# "details") and a list of Available Products (each with displayName,
-# metricName, unitPrice, and the "category" it was matched against).
-
-# For EACH requirement, work out which product(s)/metric(s) are needed, how
-# much of each metric is consumed, and the resulting pre-tax cost. Return
-# ONLY a JSON array, no markdown fences, no commentary, covering ALL
-# requirements together:
-
-# [
-#   {
-#     "category": "<the requirement's category, copied exactly>",
-#     "displayName": "<label for this line item - can be descriptive, does NOT need to match Available Products verbatim>",
-#     "metricName": "<the metric being consumed, e.g. 'OCPU Per Hour'>",
-#     "unitPrice": <the unitPrice copied EXACTLY from the Available Products entry you used>,
-#     "qty": <numeric quantity of the metric consumed>,
-#     "calculation": "<plain-English arithmetic showing the full derivation, e.g. '744 hrs/month * 2 OCPUs * 5.00 USD = 7440'>",
-#     "cost": <qty * unitPrice, computed by you, numeric, pre-tax>
-#   }
-# ]
-
-# Rules:
-# - Only use unitPrice values that come from the Available Products supplied
-#   for that requirement's category - never invent a price. Copy it exactly
-#   as given, then do the multiplication yourself.
-# - "cost" must equal qty * unitPrice exactly (pre-tax). Do not round unless
-#   the arithmetic naturally produces a rounded figure.
-# - For VM requirements, select only E-series VM shapes; storage is Block
-#   Storage - label it clearly as VM storage in "displayName" so it's
-#   distinguishable from standalone Block Storage, but you do not need to
-#   force an exact product-list string match. Include an appropriate OS
-#   image / licensing line item where relevant.
-# - Avoid Cloud@Customer products whenever a non-Cloud@Customer alternative
-#   exists.
-# - Avoid Exadata unless specified.
-# - Do NOT apply or mention tax/GST anywhere - qty, unitPrice, and cost are
-#   all pre-tax.
-# - Every requirement in the input must be addressed by at least one item
-#   in the output (unless truly no candidate product fits it).
-# - Block Storage PU = GB*20 for high performance else *10.
-# """
-
-# _products_cache: List[Dict[str, Any]] = []
-
-
-# def fetch_products(force: bool = False) -> List[Dict[str, Any]]:
-#     global _products_cache
-#     if force or not _products_cache:
-#         resp = requests.get(ORACLE_PRICE_URL, timeout=30)
-#         resp.raise_for_status()
-#         _products_cache = resp.json()["items"]
-#     return _products_cache
-
-
-# def build_lookup(products) -> Dict[tuple, float]:
-#     lk = {}
-#     for p in products:
-#         locs = p.get("currencyCodeLocalizations") or []
-#         if not locs:
-#             continue
-#         prices = locs[0].get("prices") or []
-#         if not prices:
-#             continue
-#         lk[(p["displayName"], p["metricName"])] = prices[0]["value"]
-#     return lk
-
-
-# def relevant_products(category_name: str, products, lookup, limit: int = None):
-#     target = category_name.lower().strip()
-#     results = []
-#     for p in products:
-#         svc_cat = p.get("serviceCategory", "").lower().strip()
-#         if target in svc_cat and 'cloud@customer' not in svc_cat:
-#             key = (p["displayName"], p["metricName"])
-#             if key in lookup:
-#                 results.append({
-#                     "displayName": p["displayName"],
-#                     "metricName": p["metricName"],
-#                     "unitPrice": lookup[key],
-#                 })
-#     return results[:limit] if limit else results
-
-
-# def excel_to_requirements(file_bytes):
-#     wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
-#     ws = wb.active
-#     rows = list(ws.iter_rows(values_only=True))
-#     output = []
-#     i = 0
-#     while i < len(rows):
-#         row = rows[i]
-#         # Detect category row
-#         if (
-#             row
-#             and row[0]
-#             and str(row[0]).strip().startswith("Category:")
-#         ):
-#             category = str(row[0]).replace("Category:", "").strip()
-#             # Header row
-#             if i + 1 >= len(rows):
-#                 break
-#             headers = [
-#                 str(h).strip() if h is not None else None
-#                 for h in rows[i + 1]
-#             ]
-#             details = []
-#             j = i + 2
-#             while j < len(rows):
-#                 current = rows[j]
-#                 # Stop at next category
-#                 if (
-#                     current
-#                     and current[0]
-#                     and str(current[0]).strip().startswith("Category:")
-#                 ):
-#                     break
-#                 # Skip blank rows
-#                 if not any(cell is not None for cell in current):
-#                     j += 1
-#                     continue
-#                 item = {}
-#                 for k, header in enumerate(headers):
-#                     if (
-#                         header
-#                         and k < len(current)
-#                         and current[k] is not None
-#                     ):
-#                         item[header] = current[k]
-#                 if item:
-#                     details.append(item)
-#                 j += 1
-#             output.append({
-#                 "category": category,
-#                 "details": details
-#             })
-#             i = j
-#         else:
-#             i += 1
-
-#     return output
-
-
-# def build_batch_candidates(reqs, products, lookup, limit_per_req: int = 150):
-#     """
-#     For each requirement, find relevant candidate products (with their real
-#     unitPrice attached) and tag them with the category so Gemini can map its
-#     output back correctly and multiply out the cost itself.
-#     Returns a flat, deduplicated list.
-#     """
-#     seen = set()
-#     batch_candidates = []
-#     for req in reqs:
-#         category = req.get("category", "")
-#         cands = relevant_products(category, products, lookup, limit=limit_per_req)
-#         for c in cands:
-#             key = (category, c["displayName"], c["metricName"])
-#             if key in seen:
-#                 continue
-#             seen.add(key)
-#             batch_candidates.append({
-#                 "category": category,
-#                 "displayName": c["displayName"],
-#                 "metricName": c["metricName"],
-#                 "unitPrice": c["unitPrice"],
-#             })
-#     return batch_candidates
-
-
-# def ask_gemini_batch(reqs: List[Dict[str, Any]], candidates: List[Dict[str, Any]]):
-#     """
-#     Single Gemini call covering ALL requirements + ALL matched candidates
-#     (with real unitPrice) for the entire uploaded sheet. Gemini returns the
-#     final "cost" per line item already multiplied out.
-#     """
-#     prompt = (
-#         SYSTEM_PROMPT
-#         + "\nRequirements:\n" + json.dumps(reqs, indent=2, default=str)
-#         + "\nAvailable Products:\n" + json.dumps(candidates, indent=2, default=str)
-#     )
-#     r = client.models.generate_content(
-#         model=GEMINI_MODEL,
-#         contents=prompt,
-#         config=types.GenerateContentConfig(response_mime_type="application/json"),
-#     )
-#     print(prompt)
-#     return json.loads(r.text)
-
-
-# def run_oci_estimate(file_bytes: bytes) -> Dict[str, Any]:
-#     """
-#     Full OCI estimation pipeline for a given uploaded Excel file's raw bytes.
-#     Mirrors the original /api/estimate endpoint logic exactly, just extracted
-#     into a reusable function so main.py can call it alongside Azure.
-#     """
-#     reqs = excel_to_requirements(file_bytes)
-
-#     if not reqs:
-#         return {"report": [], "total": 0, "warnings": ["No requirements found in the uploaded sheet"]}
-
-#     products = fetch_products()
-#     lookup = build_lookup(products)
-
-#     warnings: List[str] = []
-#     batch_candidates = build_batch_candidates(reqs, products, lookup)
-
-#     # Flag requirements with zero matched candidates up front
-#     matched_categories = {c["category"] for c in batch_candidates}
-#     for req in reqs:
-#         cat = req.get("category", "")
-#         if cat not in matched_categories:
-#             warnings.append(f"No matching OCI products found for '{cat}'")
-
-#     if not batch_candidates:
-#         return {"report": [], "total": 0, "warnings": warnings}
-
-#     items = ask_gemini_batch(reqs, batch_candidates)
-
-#     report = []
-#     for it in items:
-#         try:
-#             cost = round(float(it.get("cost", 0)), 2)
-#         except (TypeError, ValueError):
-#             warnings.append(
-#                 f"Could not parse cost for '{it.get('displayName', '?')}'; skipped"
-#             )
-#             continue
-
-#         report.append({
-#             "category": it.get("category", ""),
-#             "product": it.get("displayName", ""),
-#             "metric": it.get("metricName", ""),
-#             "calculation": it.get("calculation", ""),
-#             "cost": cost,
-#         })
-
-#     total = round(sum(r["cost"] for r in report), 2)
-#     return {"report": report, "total": total, "warnings": warnings}
+    return {"report": report, "total": float(round(total, 2)), "warnings": warnings}
